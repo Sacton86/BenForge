@@ -1,0 +1,159 @@
+name: Build and Release Executables
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64 Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inject Version Tag
+        shell: bash
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME:-v1.0.0}
+          echo "$TAG_VERSION" > VERSION.txt
+          echo "RELEASE_VERSION=$TAG_VERSION" >> $GITHUB_ENV
+
+      - name: Download Portable Blender Engine (Windows)
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path engine/blender_portable
+          Write-Host "Downloading Blender 4.1.1 Portable Archive..."
+          Invoke-WebRequest -Uri "https://download.blender.org/release/Blender4.1/blender-4.1.1-windows-x64.zip" -OutFile "blender.zip"
+          Write-Host "Extracting Blender Archive..."
+          Expand-Archive -Path "blender.zip" -DestinationPath "engine/blender_temp"
+          Get-ChildItem -Path "engine/blender_temp/*" | Move-Item -Destination "engine/blender_portable"
+          Remove-Item -Recurse -Force engine/blender_temp, blender.zip
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Executable with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed `
+            --add-data "engine/blender_portable;engine/blender_portable" `
+            --add-data "blender_worker.py;." `
+            --add-data "VERSION.txt;." `
+            --name "HelmetUnfolder_${{ env.RELEASE_VERSION }}" `
+            app.py
+
+      - name: Compress Release Archive
+        shell: powershell
+        run: |
+          Compress-Archive -Path "dist/HelmetUnfolder_${{ env.RELEASE_VERSION }}/*" `
+            -DestinationPath "HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64.zip"
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64
+          path: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64.zip
+
+  build-linux:
+    name: Build Linux x64 Standalone
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Inject Version Tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME:-v1.0.0}
+          echo "$TAG_VERSION" > VERSION.txt
+          echo "RELEASE_VERSION=$TAG_VERSION" >> $GITHUB_ENV
+
+      - name: Download Portable Blender Engine (Linux)
+        run: |
+          mkdir -p engine/blender_linux engine/blender_temp
+          echo "Downloading Blender 4.1.1 Linux Archive..."
+          curl -L "https://download.blender.org/release/Blender4.1/blender-4.1.1-linux-x64.tar.xz" -o blender.tar.xz
+          tar -xf blender.tar.xz -C engine/blender_temp --strip-components=1
+          mv engine/blender_temp/* engine/blender_linux/
+          rm -rf engine/blender_temp blender.tar.xz
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Linux Bundle with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed \
+            --add-data "engine/blender_linux:engine/blender_linux" \
+            --add-data "blender_worker.py:." \
+            --add-data "VERSION.txt:." \
+            --name "HelmetUnfolder_${{ env.RELEASE_VERSION }}" \
+            app.py
+
+      - name: Package Linux Tarball
+        run: |
+          cd dist
+          tar -czf "../HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz" "HelmetUnfolder_${{ env.RELEASE_VERSION }}"
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64
+          path: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz
+
+  publish-release:
+    name: Publish Release to GitHub
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_artifacts/*.zip
+            release_artifacts/*.tar.gz
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## 3D Helmet Pattern Unfolder (${{ github.ref_name }})
+            
+            Standalone 3D-to-2D cut pattern generator with embedded Blender headless unfolding engine.
+            
+            ### Downloads:
+            - **Windows (x64)**: `HelmetUnfolder_${{ github.ref_name }}_Windows_x64.zip` (Extract & run `.exe`, portable)
+            - **Linux (x64)**: `HelmetUnfolder_${{ github.ref_name }}_Linux_x64.tar.gz` (Extract & run binary, portable)
+            
+            ### Changes:
+            - Automated standalone build with embedded portable Blender 4.1.1 engine
+            - Native `io_export_paper_model` vector SVG/PDF cut patterns
+            - Multi-mesh auto-join and mesh decimation controls
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
