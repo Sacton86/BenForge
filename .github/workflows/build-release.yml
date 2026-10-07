@@ -51,21 +51,23 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed `
             --add-data "engine/blender_portable;engine/blender_portable" `
             --add-data "blender_worker.py;." `
+            --add-data "svg_layer_processor.py;." `
+            --add-data "tooltip.py;." `
             --add-data "VERSION.txt;." `
-            --name "HelmetUnfolder_${{ env.RELEASE_VERSION }}" `
+            --name "BenForge_${{ env.RELEASE_VERSION }}" `
             app.py
 
       - name: Compress Release Archive
         shell: powershell
         run: |
-          Compress-Archive -Path "dist/HelmetUnfolder_${{ env.RELEASE_VERSION }}/*" `
-            -DestinationPath "HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64.zip"
+          Compress-Archive -Path "dist/BenForge_${{ env.RELEASE_VERSION }}/*" `
+            -DestinationPath "BenForge_${{ env.RELEASE_VERSION }}_Windows_x64.zip"
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64
-          path: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Windows_x64.zip
+          name: BenForge_${{ env.RELEASE_VERSION }}_Windows_x64
+          path: BenForge_${{ env.RELEASE_VERSION }}_Windows_x64.zip
 
   build-linux:
     name: Build Linux x64 Standalone
@@ -105,20 +107,22 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed \
             --add-data "engine/blender_linux:engine/blender_linux" \
             --add-data "blender_worker.py:." \
+            --add-data "svg_layer_processor.py:." \
+            --add-data "tooltip.py:." \
             --add-data "VERSION.txt:." \
-            --name "HelmetUnfolder_${{ env.RELEASE_VERSION }}" \
+            --name "BenForge_${{ env.RELEASE_VERSION }}" \
             app.py
 
       - name: Package Linux Tarball
         run: |
           cd dist
-          tar -czf "../HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz" "HelmetUnfolder_${{ env.RELEASE_VERSION }}"
+          tar -czf "../BenForge_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz" "BenForge_${{ env.RELEASE_VERSION }}"
 
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64
-          path: HelmetUnfolder_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz
+          name: BenForge_${{ env.RELEASE_VERSION }}_Linux_x64
+          path: BenForge_${{ env.RELEASE_VERSION }}_Linux_x64.tar.gz
 
   publish-release:
     name: Publish Release to GitHub
@@ -141,18 +145,20 @@ jobs:
             release_artifacts/*.tar.gz
           name: Release ${{ github.ref_name }}
           body: |
-            ## 3D Helmet Pattern Unfolder (${{ github.ref_name }})
+            ## BenForge — 3D Pattern Unfolder & Fabrication Suite (${{ github.ref_name }})
             
-            Standalone 3D-to-2D cut pattern generator with embedded Blender headless unfolding engine.
+            Standalone 3D-to-2D cut and bend pattern generator for sheet metal, laser cutters, foam armor, and papercraft.
             
             ### Downloads:
-            - **Windows (x64)**: `HelmetUnfolder_${{ github.ref_name }}_Windows_x64.zip` (Extract & run `.exe`, portable)
-            - **Linux (x64)**: `HelmetUnfolder_${{ github.ref_name }}_Linux_x64.tar.gz` (Extract & run binary, portable)
+            - **Windows (x64)**: `BenForge_${{ github.ref_name }}_Windows_x64.zip` (Extract & run `.exe`, portable)
+            - **Linux (x64)**: `BenForge_${{ github.ref_name }}_Linux_x64.tar.gz` (Extract & run binary, portable)
             
-            ### Changes:
-            - Automated standalone build with embedded portable Blender 4.1.1 engine
-            - Native `io_export_paper_model` vector SVG/PDF cut patterns
-            - Multi-mesh auto-join and mesh decimation controls
+            ### Highlights:
+            - Full-body anatomical fitment & sizing (Head, Torso, Arms, Legs, Custom)
+            - Material presets: Sheet Metal (weld & brake), EVA Foam (bevels), Papercraft
+            - Machine vector layer grouping (LightBurn, Glowforge, Cricut, Plasma CNC)
+            - Dihedral press brake angle and weld seam numbering annotations
+            - Contextual tooltips with toggle control
           draft: false
           prerelease: false
         env:

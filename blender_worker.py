@@ -1,40 +1,99 @@
 """
 blender_worker.py
-Headless execution script executed by Blender to import,
-decimate, unfold, and export 3D meshes to 2D vector/paper patterns.
+Headless execution engine executed by Blender for BenForge.
+Supports mesh inspection (bounding box dimensions & polycount) and
+unfolding 3D models into 2D cut/bend patterns for sheet metal, foam, and paper.
 """
 
 import sys
+import os
 import json
 import traceback
 import bpy
 
-def run_unfolder():
-    # 1. Parse JSON configuration passed after '--'
-    try:
-        argv = sys.argv[sys.argv.index("--") + 1:]
-        config = json.loads(argv[0])
-    except (ValueError, IndexError) as e:
-        print(f"Error parsing CLI arguments: {e}")
+def run_inspect(config):
+    """Loads a 3D mesh and returns its bounding box dimensions and polygon count."""
+    input_file = config.get("input_file")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    file_lower = input_file.lower()
+    if file_lower.endswith('.stl'):
+        if hasattr(bpy.ops.wm, 'stl_import'):
+            bpy.ops.wm.stl_import(filepath=input_file)
+        elif hasattr(bpy.ops.import_mesh, 'stl'):
+            bpy.ops.import_mesh.stl(filepath=input_file)
+    elif file_lower.endswith('.obj'):
+        if hasattr(bpy.ops.wm, 'obj_import'):
+            bpy.ops.wm.obj_import(filepath=input_file)
+        elif hasattr(bpy.ops.import_scene, 'obj'):
+            bpy.ops.import_scene.obj(filepath=input_file)
+    else:
+        print(f"Unsupported format: {input_file}")
         sys.exit(1)
 
+    meshes = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+    if not meshes:
+        print("No valid mesh objects found.")
+        sys.exit(1)
+
+    # Join meshes if multiple to measure full bounding box
+    if len(meshes) > 1:
+        bpy.ops.object.select_all(action='DESELECT')
+        for m in meshes:
+            m.select_set(True)
+        bpy.context.view_layer.objects.active = meshes[0]
+        bpy.ops.object.join()
+        active_obj = bpy.context.view_layer.objects.active
+    else:
+        active_obj = meshes[0]
+
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    dims = active_obj.dimensions  # Vector (X, Y, Z) in meters / scene units
+    poly_count = len(active_obj.data.polygons)
+    vert_count = len(active_obj.data.vertices)
+
+    # Standard STL/OBJ files from CAD are usually exported in mm.
+    # If dimensions are under 5 units, model might be in meters; otherwise in mm.
+    dim_x_mm = float(dims.x * 1000.0) if max(dims.x, dims.y, dims.z) < 2.0 else float(dims.x)
+    dim_y_mm = float(dims.y * 1000.0) if max(dims.x, dims.y, dims.z) < 2.0 else float(dims.y)
+    dim_z_mm = float(dims.z * 1000.0) if max(dims.x, dims.y, dims.z) < 2.0 else float(dims.z)
+
+    result = {
+        "dim_x_mm": round(dim_x_mm, 2),
+        "dim_y_mm": round(dim_y_mm, 2),
+        "dim_z_mm": round(dim_z_mm, 2),
+        "poly_count": poly_count,
+        "vertex_count": vert_count
+    }
+    print("BENFORGE_INSPECT_RESULT:" + json.dumps(result))
+    sys.exit(0)
+
+
+def run_unfolder(config):
+    """Executes the decimation, scaling, and unfolding pipeline."""
     input_file = config["input_file"]
     output_file = config["output_file"]
     decimate_ratio = float(config.get("decimate_ratio", 1.0))
     tab_size = float(config.get("tab_size", 5.0))
+    use_tabs = bool(config.get("use_tabs", False))
     page_format = config.get("page_format", "A3")
     export_format = config.get("export_format", "SVG").upper()
     join_meshes = config.get("join_meshes", True)
     scale_factor = float(config.get("scale_factor", 1.0))
+    material_mode = config.get("material_mode", "Sheet Metal")
+    machine_preset = config.get("machine_preset", "LightBurn (Laser)")
+    print_bend_angles = config.get("print_bend_angles", True)
+    print_seam_numbers = config.get("print_seam_numbers", True)
+    kerf_offset_mm = float(config.get("kerf_offset_mm", 0.0))
 
-    print(f"Processing input file: {input_file}")
-    print(f"Output target: {output_file} (Format: {export_format}, Page: {page_format})")
-    print(f"Settings: decimate={decimate_ratio:.2f}, tab_size={tab_size}mm, scale={scale_factor}")
+    print(f"BenForge Unfold Task: {input_file} -> {output_file}")
+    print(f"Material: {material_mode} | Machine: {machine_preset} | Scale Factor: {scale_factor:.4f}")
+    print(f"Decimate: {decimate_ratio:.2f} | Tabs: {'ON (' + str(tab_size) + 'mm)' if use_tabs else 'OFF (Weld/Bevel Edge)'}")
 
-    # 2. Reset Scene to a completely clean state
+    # 1. Reset Scene
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
-    # 3. Import Mesh (Support both modern Blender 4.x and legacy Blender 3.x operators)
+    # 2. Import Mesh
     file_lower = input_file.lower()
     try:
         if file_lower.endswith('.stl'):
@@ -43,14 +102,14 @@ def run_unfolder():
             elif hasattr(bpy.ops.import_mesh, 'stl'):
                 bpy.ops.import_mesh.stl(filepath=input_file)
             else:
-                raise RuntimeError("No STL import operator available in this Blender environment.")
+                raise RuntimeError("No STL import operator available in this Blender build.")
         elif file_lower.endswith('.obj'):
             if hasattr(bpy.ops.wm, 'obj_import'):
                 bpy.ops.wm.obj_import(filepath=input_file)
             elif hasattr(bpy.ops.import_scene, 'obj'):
                 bpy.ops.import_scene.obj(filepath=input_file)
             else:
-                raise RuntimeError("No OBJ import operator available in this Blender environment.")
+                raise RuntimeError("No OBJ import operator available in this Blender build.")
         else:
             print(f"Unsupported format: {input_file}")
             sys.exit(1)
@@ -59,21 +118,17 @@ def run_unfolder():
         traceback.print_exc()
         sys.exit(1)
 
-    # 4. Mesh Resolution & Multi-mesh handling
+    # 3. Select and join mesh objects
     selected_objs = [o for o in bpy.context.selected_objects if o.type == 'MESH']
     if not selected_objs:
-        # Fallback check all objects in scene
         selected_objs = [o for o in bpy.context.scene.objects if o.type == 'MESH']
 
     if not selected_objs:
         print("No valid mesh objects found in imported file.")
         sys.exit(1)
 
-    print(f"Found {len(selected_objs)} mesh object(s).")
-
-    # If multiple meshes exist and join is requested, join them into one unified model
     if len(selected_objs) > 1 and join_meshes:
-        print("Joining multiple mesh objects into a single object...")
+        print(f"Joining {len(selected_objs)} mesh parts into a unified model...")
         bpy.ops.object.select_all(action='DESELECT')
         for o in selected_objs:
             o.select_set(True)
@@ -85,65 +140,116 @@ def run_unfolder():
         bpy.context.view_layer.objects.active = obj
         obj.select_set(True)
 
-    # Apply any pre-existing transforms (location, rotation, scale)
+    # Apply initial transforms
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
-    # Optional uniform scaling if requested
+    # 4. Anatomical / User Scaling
     if scale_factor != 1.0 and scale_factor > 0:
         obj.scale = (scale_factor, scale_factor, scale_factor)
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-        print(f"Applied scale multiplier: {scale_factor}")
+        print(f"Applied scaling multiplier: {scale_factor:.4f}")
 
-    # 5. Decimate Mesh (Essential for dense internet models / 3D scans)
+    # 5. Polygon Decimation
     if decimate_ratio < 0.999:
         poly_before = len(obj.data.polygons)
         mod = obj.modifiers.new(name="Decimate", type='DECIMATE')
         mod.ratio = max(0.01, min(1.0, decimate_ratio))
         bpy.ops.object.modifier_apply(modifier="Decimate")
         poly_after = len(obj.data.polygons)
-        print(f"Decimation applied: {poly_before} -> {poly_after} polygons ({decimate_ratio * 100:.1f}%)")
+        print(f"Mesh decimated: {poly_before} -> {poly_after} polygons ({decimate_ratio * 100:.1f}%)")
 
-    # 6. Enable Built-in Paper Model Addon
+    # 6. Enable io_export_paper_model Addon
     addon_name = "io_export_paper_model"
     if addon_name not in bpy.context.preferences.addons:
         try:
             bpy.ops.preferences.addon_enable(module=addon_name)
-            print(f"Addon '{addon_name}' enabled successfully.")
         except Exception as e:
-            print(f"Warning: Could not enable '{addon_name}' via standard preferences: {e}")
-            # Try to register manually if present in path
+            print(f"Warning on addon_enable: {e}")
             try:
                 import io_export_paper_model
                 io_export_paper_model.register()
-                print("Registered io_export_paper_model directly via Python import.")
             except Exception as e2:
-                print(f"Fatal: Failed to load '{addon_name}': {e2}")
+                print(f"Fatal: Cannot load {addon_name}: {e2}")
                 sys.exit(1)
 
-    # 7. Unfold and Export
-    print("Unfolding 3D mesh into 2D cut pattern islands...")
+    # 7. Unfold Mesh
+    print("Calculating optimal cut seams and unfolding mesh...")
     try:
         bpy.ops.export_paper_model.unfold()
     except Exception as e:
-        print(f"Paper model unfolding step warning: {e}")
+        print(f"Unfold operator notice: {e}")
 
-    # tab_size in mm converted to meters (assuming standard metric unit scene)
-    tab_size_m = tab_size / 1000.0
+    # 8. Export to Vector File
+    tab_size_m = (tab_size / 1000.0) if use_tabs else 0.001
 
-    print(f"Exporting pattern to {output_file}...")
+    print(f"Exporting raw pattern to {output_file}...")
     try:
         bpy.ops.export_paper_model.execute(
             filepath=output_file,
             page_size_preset=page_format,
-            use_tabs=True,
+            use_tabs=use_tabs,
             tabs_width=tab_size_m,
             export_format=export_format
         )
-        print("Unfold and export completed successfully.")
+        print("Raw pattern exported successfully.")
     except Exception as e:
-        print(f"Fatal error during export_paper_model.execute: {e}")
+        print(f"Error executing paper model exporter: {e}")
         traceback.print_exc()
         sys.exit(1)
 
+    # 9. Post-Process SVG into Machine Layers (for SVG exports)
+    if export_format == "SVG" and os.path.exists(output_file):
+        try:
+            # Import post processor from current directory
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            if script_dir not in sys.path:
+                sys.path.append(script_dir)
+            import svg_layer_processor
+            ok, msg = svg_layer_processor.process_svg_layers(
+                svg_filepath=output_file,
+                preset_name=machine_preset,
+                material_mode=material_mode,
+                use_tabs=use_tabs,
+                print_bend_angles=print_bend_angles,
+                print_seam_numbers=print_seam_numbers,
+                kerf_offset_mm=kerf_offset_mm
+            )
+            print(f"SVG Layer Processor: {msg}")
+        except Exception as pe:
+            print(f"Notice: Post-processing layer separation skipped: {pe}")
+
+    print("BENFORGE_SUCCESS")
+
+
+def main():
+    if "--" not in sys.argv:
+        print("Usage: blender --background --python blender_worker.py -- [inspect|unfold] <json_payload>")
+        sys.exit(1)
+
+    args = sys.argv[sys.argv.index("--") + 1:]
+    if not args:
+        print("No operation specified.")
+        sys.exit(1)
+
+    op = args[0].lower()
+    if op in ("inspect", "unfold"):
+        payload_str = args[1] if len(args) > 1 else "{}"
+    else:
+        # Default backward compatibility: first argument is json payload for unfold
+        op = "unfold"
+        payload_str = args[0]
+
+    try:
+        config = json.loads(payload_str)
+    except Exception as e:
+        print(f"Failed to parse config JSON: {e}")
+        sys.exit(1)
+
+    if op == "inspect":
+        run_inspect(config)
+    else:
+        run_unfolder(config)
+
+
 if __name__ == "__main__":
-    run_unfolder()
+    main()

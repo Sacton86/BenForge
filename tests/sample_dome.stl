@@ -1,0 +1,72 @@
+solid sample_dome
+  facet normal 0 0 1
+    outer loop
+      vertex -100 -100 200
+      vertex 100 -100 200
+      vertex 100 100 200
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex -100 -100 200
+      vertex 100 100 200
+      vertex -100 100 200
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex -100 -100 200
+      vertex -120 -120 0
+      vertex 120 -120 0
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex -100 -100 200
+      vertex 120 -120 0
+      vertex 100 -100 200
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex 100 -100 200
+      vertex 120 -120 0
+      vertex 120 120 0
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex 100 -100 200
+      vertex 120 120 0
+      vertex 100 100 200
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex 100 100 200
+      vertex 120 120 0
+      vertex -120 120 0
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex 100 100 200
+      vertex -120 120 0
+      vertex -100 100 200
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex -100 100 200
+      vertex -120 120 0
+      vertex -120 -120 0
+    endloop
+  endfacet
+  facet normal 0 0 1
+    outer loop
+      vertex -100 100 200
+      vertex -120 -120 0
+      vertex -100 -100 200
+    endloop
+  endfacet
+endsolid sample_dome
