@@ -68,14 +68,23 @@ class BenForgeApp(ctk.CTk):
                 if os.path.exists(p):
                     return p
 
-        # 2. Local bundled portable engine
-        portable_win = os.path.join(base_dir, "engine", "blender_portable", "blender.exe")
-        if is_windows and os.path.exists(portable_win):
-            return portable_win
-
-        portable_linux = os.path.join(base_dir, "engine", "blender_linux", "blender")
-        if not is_windows and os.path.exists(portable_linux):
-            return portable_linux
+        # 2. Local bundled portable engine (search base_dir, parent dir, cwd, and project dir)
+        engine_dirs = [
+            os.path.join(base_dir, "engine"),
+            os.path.join(base_dir, "..", "engine"),
+            os.path.join(os.getcwd(), "engine"),
+            "/home/sacton3/Desktop/BenForge/engine",
+            "/home/sacton3/Desktop/BenFold/engine"
+        ]
+        for ed in engine_dirs:
+            if is_windows:
+                p = os.path.join(ed, "blender_portable", "blender.exe")
+                if os.path.exists(p):
+                    return p
+            else:
+                p = os.path.join(ed, "blender_linux", "blender")
+                if os.path.exists(p) and os.access(p, os.X_OK):
+                    return p
 
         # 3. System PATH detection
         system_blender = shutil.which("blender.exe" if is_windows else "blender")
@@ -88,11 +97,14 @@ class BenForgeApp(ctk.CTk):
                 "/usr/bin/blender",
                 "/usr/local/bin/blender",
                 "/snap/bin/blender",
+                "/var/lib/flatpak/exports/bin/org.blender.Blender",
                 os.path.expanduser("~/.local/bin/blender"),
-                os.path.expanduser("~/blender/blender")
+                os.path.expanduser("~/blender/blender"),
+                os.path.expanduser("~/.local/share/flatpak/exports/bin/org.blender.Blender")
             ]
             for c in candidates:
                 if os.path.exists(c) and os.access(c, os.X_OK):
+                    return c
                     return c
         else:
             win_candidates = [
