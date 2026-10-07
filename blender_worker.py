@@ -8,8 +8,26 @@ unfolding 3D models into 2D cut/bend patterns for sheet metal, foam, and paper.
 import sys
 import os
 import json
+import glob
+import functools
 import traceback
 import bpy
+import bmesh
+
+# Force line-buffered/flushed output so the parent GUI can read progress and
+# error markers even if Blender is terminated mid-run (background mode buffers
+# stdout heavily by default).
+print = functools.partial(print, flush=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+
+def emit_error(message):
+    """Print a clean, single-line error marker the GUI can surface verbatim."""
+    flat = " ".join(str(message).split())
+    print("BENFORGE_ERROR:" + flat)
 
 def run_inspect(config):
     """Loads a 3D mesh and returns its bounding box dimensions and polygon count."""
@@ -157,12 +175,51 @@ def run_unfolder(config):
     if decimate_ratio < 0.999:
         poly_before = len(obj.data.polygons)
         mod = obj.modifiers.new(name="Decimate", type='DECIMATE')
-        mod.ratio = max(0.01, min(1.0, decimate_ratio))
+        mod.ratio = max(0.0002, min(1.0, decimate_ratio))
         bpy.ops.object.modifier_apply(modifier="Decimate")
         poly_after = len(obj.data.polygons)
         print(f"Mesh decimated: {poly_before} -> {poly_after} polygons ({decimate_ratio * 100:.1f}%)")
 
-    # 6. Enable io_export_paper_model Addon
+    # 6. Mesh Cleanup / Repair
+    # The paper-model unfolder refuses to process meshes containing zero-length
+    # edges, zero-area faces, or non-planar ("twisted") polygons. Decimation and
+    # imported scans routinely introduce these, so we repair the mesh here.
+    # Order matters: triangulate FIRST (guarantees planar faces and exposes
+    # slivers), THEN merge/dissolve the degenerate geometry that triangulation
+    # can create.
+    print("Cleaning and repairing mesh geometry before unfolding...")
+    try:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
+        bpy.ops.mesh.remove_doubles(threshold=1e-5)
+        bpy.ops.mesh.dissolve_degenerate(threshold=1e-5)
+        bpy.ops.mesh.delete_loose()
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Final guarantee: remove any face the unfolder would still reject.
+        # This matches io_export_paper_model's own epsilon (area < 1e-6).
+        me = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        degen_faces = [f for f in bm.faces if f.calc_area() < 1e-6]
+        if degen_faces:
+            bmesh.ops.delete(bm, geom=degen_faces, context='FACES')
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+        print(f"Mesh cleanup complete: {len(me.polygons)} faces ready "
+              f"(removed {len(degen_faces)} degenerate face(s)).")
+    except Exception as e:
+        print(f"Mesh cleanup notice: {e}")
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    # 7. Enable io_export_paper_model Addon
     addon_name = "io_export_paper_model"
     if addon_name not in bpy.context.preferences.addons:
         try:
@@ -173,25 +230,13 @@ def run_unfolder(config):
                 import io_export_paper_model
                 io_export_paper_model.register()
             except Exception as e2:
-                print(f"Fatal: Cannot load {addon_name}: {e2}")
+                emit_error(f"Cannot load unfolding engine ({addon_name}): {e2}")
                 sys.exit(1)
 
-    # 7. Unfold Mesh
-    print("Calculating optimal cut seams and unfolding mesh...")
-    try:
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        if hasattr(bpy.ops.mesh, 'unfold'):
-            bpy.ops.mesh.unfold()
-        bpy.ops.object.mode_set(mode='OBJECT')
-    except Exception as e:
-        print(f"Unfold operator notice: {e}")
-        try:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        except Exception:
-            pass
-
     # 8. Export to Vector File
+    # NOTE: the exporter performs the unfold internally during prepare(), so we
+    # do NOT pre-call mesh.unfold() (that would double the expensive compute).
+    print("Calculating optimal cut seams and unfolding mesh...")
     tab_size_m = (tab_size / 1000.0) if use_tabs else 0.005
     page_preset = page_format.upper().split()[0] if page_format else "A3"
     valid_presets = ["A4", "A3", "A2", "A1", "LETTER", "LEGAL"]
@@ -220,31 +265,62 @@ def run_unfolder(config):
             raise RuntimeError("No paper model exporter operator found in Blender.")
         print("Raw pattern exported successfully.")
     except Exception as e:
-        print(f"Error executing paper model exporter: {e}")
+        # The unfolder raises UnfoldError with a human-readable first arg when
+        # the mesh is unsuitable (e.g. still-degenerate geometry). Surface that
+        # clean message instead of the raw BMesh traceback.
+        msg = str(e)
+        if "zero-area" in msg or "zero-length" in msg or "twisted" in msg or "inside-out" in msg:
+            clean = msg.split("Export failed")[0].strip() or msg
+            emit_error(
+                "The mesh could not be unfolded: " + clean + ". "
+                "Try increasing decimation (fewer polygons) or using a cleaner model."
+            )
+        elif "no UV Map slots" in msg:
+            emit_error("The mesh has no free UV map slots. Remove a UV map and retry.")
+        else:
+            emit_error("Unfolding engine error: " + msg)
         traceback.print_exc()
         sys.exit(1)
 
-    # 9. Post-Process SVG into Machine Layers (for SVG exports)
-    if export_format == "SVG" and os.path.exists(output_file):
+    # 9. Resolve the actual files written. The SVG exporter writes ONE file
+    # (output_file) for single-page nets, but "<base>_<page>.svg" per page when
+    # a net spans multiple pages. Discover whichever were produced.
+    base, ext = os.path.splitext(output_file)
+    produced = []
+    if os.path.exists(output_file):
+        produced.append(output_file)
+    produced.extend(sorted(p for p in glob.glob(f"{base}_*{ext}") if p not in produced))
+    if not produced:
+        emit_error(
+            "The unfold completed but produced no output pages. The pattern may "
+            "be empty; try a different model or less aggressive decimation."
+        )
+        sys.exit(1)
+    print(f"Produced {len(produced)} page file(s).")
+
+    # 10. Post-Process every SVG page into Machine Layers (for SVG exports)
+    if export_format == "SVG":
         try:
-            # Import post processor from current directory
             script_dir = os.path.dirname(os.path.abspath(__file__))
             if script_dir not in sys.path:
                 sys.path.append(script_dir)
             import svg_layer_processor
-            ok, msg = svg_layer_processor.process_svg_layers(
-                svg_filepath=output_file,
-                preset_name=machine_preset,
-                material_mode=material_mode,
-                use_tabs=use_tabs,
-                print_bend_angles=print_bend_angles,
-                print_seam_numbers=print_seam_numbers,
-                kerf_offset_mm=kerf_offset_mm
-            )
-            print(f"SVG Layer Processor: {msg}")
+            for page_path in produced:
+                ok, msg = svg_layer_processor.process_svg_layers(
+                    svg_filepath=page_path,
+                    preset_name=machine_preset,
+                    material_mode=material_mode,
+                    use_tabs=use_tabs,
+                    print_bend_angles=print_bend_angles,
+                    print_seam_numbers=print_seam_numbers,
+                    kerf_offset_mm=kerf_offset_mm
+                )
+                print(f"SVG Layer Processor [{os.path.basename(page_path)}]: {msg}")
         except Exception as pe:
             print(f"Notice: Post-processing layer separation skipped: {pe}")
 
+    # Report the concrete output paths back to the GUI.
+    print("BENFORGE_OUTPUT_FILES:" + json.dumps(produced))
     print("BENFORGE_SUCCESS")
 
 

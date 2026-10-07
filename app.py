@@ -7,7 +7,10 @@ GUI frontend for converting 3D meshes into flattened 2D vector cut & bend patter
 import os
 import sys
 import json
+import glob
+import math
 import shutil
+import tempfile
 import platform
 import subprocess
 import threading
@@ -16,6 +19,20 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from tooltip import ToolTip, attach_tooltip
+
+try:
+    from svg_preview import PatternPreview
+except Exception:
+    PatternPreview = None
+
+# Polygon-budget tuning for the decimation slider. The slider selects a TARGET
+# face count (not a fixed ratio), mapped logarithmically so it works whether a
+# model has 5k or 5M faces. The actual decimate ratio is target / poly_count.
+TARGET_FACES_MIN = 200       # slider far-left: coarsest usable net
+TARGET_FACES_MAX = 100000    # slider far-right: very detailed (slow to unfold)
+RECOMMENDED_FACES = 2500     # auto-selected budget on model load
+HEAVY_FACES_WARN = 8000      # warn/confirm above this many faces
+MIN_DECIMATE_RATIO = 0.0002  # smallest ratio we will ask Blender to apply
 
 # Application Metadata
 APP_NAME = "BenForge"
@@ -42,6 +59,8 @@ class BenForgeApp(ctk.CTk):
 
         self.input_file = None
         self.last_output_file = None
+        self.last_output_files = []   # all pages produced by the last export
+        self.preview_files = []       # pages produced by the last preview run
         self.is_processing = False
         self.mesh_info = None  # Holds original bounding box and polycount
         self.blender_bin = self._resolve_blender_binary()
@@ -386,27 +405,42 @@ class BenForgeApp(ctk.CTk):
         self.decimate_card = ctk.CTkFrame(self.scroll_canvas)
         self.decimate_card.pack(fill="x", padx=15, pady=6)
 
+        dec_header = ctk.CTkFrame(self.decimate_card, fg_color="transparent")
+        dec_header.pack(fill="x", padx=12, pady=(10, 2))
+
         self.lbl_decimate = ctk.CTkLabel(
-            self.decimate_card, 
-            text="Mesh Polygon Decimation (Simplifies high-density 3D scans):",
+            dec_header,
+            text="Target Pattern Complexity (polygon budget):",
             font=ctk.CTkFont(size=13, weight="bold")
         )
-        self.lbl_decimate.pack(anchor="w", padx=12, pady=(10, 2))
+        self.lbl_decimate.pack(side="left")
 
+        self.btn_auto_poly = ctk.CTkButton(
+            dec_header,
+            text="Auto",
+            width=60,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            command=self._auto_set_decimation
+        )
+        self.btn_auto_poly.pack(side="right")
+        attach_tooltip(self.btn_auto_poly, f"Automatically pick a sensible polygon budget (~{RECOMMENDED_FACES:,} faces) for a cleanly cuttable pattern.")
+
+        # Slider position is 0..1, mapped logarithmically to a target face count.
         self.slider_poly = ctk.CTkSlider(
-            self.decimate_card, 
-            from_=0.05, 
-            to=1.0, 
-            number_of_steps=19,
+            self.decimate_card,
+            from_=0.0,
+            to=1.0,
+            number_of_steps=200,
             command=self._update_slider_label
         )
-        self.slider_poly.set(0.30)
+        self.slider_poly.set(self._target_to_pos(RECOMMENDED_FACES))
         self.slider_poly.pack(fill="x", padx=12, pady=5)
-        attach_tooltip(self.slider_poly, "Reduces polygon count so patterns are cleanly cut and folded without thousands of tiny facet cuts.")
+        attach_tooltip(self.slider_poly, "Fewer polygons (left) = simpler, faster, more practical to cut/fold. More (right) = finer detail but slower to unfold.")
 
         self.lbl_slider_val = ctk.CTkLabel(
-            self.decimate_card, 
-            text="Retain 30% of polygons (Recommended for 3D scans and internet STL files)",
+            self.decimate_card,
+            text=f"Target ≈ {RECOMMENDED_FACES:,} faces (load a model to calibrate)",
             text_color="gray70",
             font=ctk.CTkFont(size=12)
         )
@@ -544,17 +578,34 @@ class BenForgeApp(ctk.CTk):
         self.action_card = ctk.CTkFrame(self.scroll_canvas, fg_color="transparent")
         self.action_card.pack(fill="x", padx=15, pady=(12, 10))
 
+        action_row = ctk.CTkFrame(self.action_card, fg_color="transparent")
+        action_row.pack(fill="x")
+
+        self.btn_preview = ctk.CTkButton(
+            action_row,
+            text="👁  Preview Pattern",
+            command=self.preview_model,
+            fg_color="#3a4a5a",
+            hover_color="#2b3a4a",
+            height=46,
+            width=190,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            state="disabled"
+        )
+        self.btn_preview.pack(side="left", padx=(0, 8))
+        attach_tooltip(self.btn_preview, "Unfold with the current settings and view the resulting 2D cut/fold pattern on screen — without saving a file yet.")
+
         self.btn_process = ctk.CTkButton(
-            self.action_card, 
-            text="2. Unfold & Export Vector Pattern", 
-            command=self.process_model, 
-            fg_color="#1f6aa5", 
+            action_row,
+            text="2. Unfold & Export Vector Pattern",
+            command=self.process_model,
+            fg_color="#1f6aa5",
             hover_color="#144f7d",
             height=46,
             font=ctk.CTkFont(size=16, weight="bold"),
             state="disabled"
         )
-        self.btn_process.pack(fill="x")
+        self.btn_process.pack(side="left", fill="x", expand=True)
         attach_tooltip(self.btn_process, "Executes the headless Blender engine to decimate, calculate seams, and generate 2D vector patterns.")
 
         self.progress_bar = ctk.CTkProgressBar(self.action_card, mode="indeterminate")
@@ -590,6 +641,21 @@ class BenForgeApp(ctk.CTk):
         )
         self.btn_open_file.pack(side="left", padx=10)
 
+        self.btn_preview_result = ctk.CTkButton(
+            self.post_export_frame,
+            text="👁  Preview Result",
+            width=160,
+            command=self._preview_last_export,
+            fg_color="#2b3a4a"
+        )
+        self.btn_preview_result.pack(side="left", padx=10)
+
+    def _set_actions_enabled(self, enabled):
+        """Enable/disable the Preview and Export buttons together."""
+        state = "normal" if enabled else "disabled"
+        self.btn_process.configure(state=state)
+        self.btn_preview.configure(state=state)
+
     def _update_engine_status(self):
         if self.blender_bin:
             short_path = self.blender_bin
@@ -618,7 +684,7 @@ class BenForgeApp(ctk.CTk):
             self.blender_bin = selected
             self._update_engine_status()
             if self.input_file and not self.is_processing:
-                self.btn_process.configure(state="normal")
+                self._set_actions_enabled(True)
 
     def _apply_material_preset(self, mat_name):
         self.opt_material.set(mat_name)
@@ -668,13 +734,65 @@ class BenForgeApp(ctk.CTk):
         self.lbl_target_dim.configure(text=f"Target Height ({'in' if is_inch else 'mm'}):")
         self._update_scale_calculation()
 
+    @staticmethod
+    def _pos_to_target(pos):
+        """Map a 0..1 slider position to a target face count (log scale)."""
+        pos = max(0.0, min(1.0, float(pos)))
+        lo, hi = math.log(TARGET_FACES_MIN), math.log(TARGET_FACES_MAX)
+        return int(round(math.exp(lo + pos * (hi - lo))))
+
+    @staticmethod
+    def _target_to_pos(target):
+        """Inverse of _pos_to_target: face count -> 0..1 slider position."""
+        target = max(TARGET_FACES_MIN, min(TARGET_FACES_MAX, int(target)))
+        lo, hi = math.log(TARGET_FACES_MIN), math.log(TARGET_FACES_MAX)
+        return (math.log(target) - lo) / (hi - lo)
+
+    def _target_faces(self):
+        """The face budget currently selected on the slider."""
+        return self._pos_to_target(self.slider_poly.get())
+
+    def _current_decimate_ratio(self):
+        """Decimate ratio = target budget / original polycount (clamped).
+
+        Returns 1.0 (no decimation) when the model already has fewer faces than
+        the target, or when the polycount is unknown.
+        """
+        target = self._target_faces()
+        if not self.mesh_info or not self.mesh_info.get("poly_count"):
+            return 1.0
+        poly = self.mesh_info["poly_count"]
+        if poly <= target:
+            return 1.0
+        return max(MIN_DECIMATE_RATIO, min(1.0, target / float(poly)))
+
+    def _auto_set_decimation(self):
+        """Pick a sensible polygon budget for the loaded model."""
+        if self.mesh_info and self.mesh_info.get("poly_count"):
+            target = min(RECOMMENDED_FACES, self.mesh_info["poly_count"])
+        else:
+            target = RECOMMENDED_FACES
+        self.slider_poly.set(self._target_to_pos(target))
+        self._update_slider_label(self.slider_poly.get())
+
     def _update_slider_label(self, val):
-        pct = int(val * 100)
-        poly_est = ""
-        if self.mesh_info and "poly_count" in self.mesh_info:
-            est = int(self.mesh_info["poly_count"] * val)
-            poly_est = f" (Est. ~{est:,} polygons)"
-        self.lbl_slider_val.configure(text=f"Retain {pct}% of polygons{poly_est}")
+        target = self._pos_to_target(val)
+        if self.mesh_info and self.mesh_info.get("poly_count"):
+            poly = self.mesh_info["poly_count"]
+            est = min(poly, target)
+            ratio = self._current_decimate_ratio()
+            if poly <= target:
+                txt = (f"Target ≈ {target:,} faces  •  keeping all "
+                       f"{poly:,} faces (no decimation needed)")
+            else:
+                txt = (f"Target ≈ {target:,} faces  •  ~{est:,} after "
+                       f"decimation  ({ratio * 100:.2f}% of {poly:,})")
+            if target > HEAVY_FACES_WARN:
+                txt += "  ⚠ slow to unfold"
+            self.lbl_slider_val.configure(text=txt)
+        else:
+            self.lbl_slider_val.configure(
+                text=f"Target ≈ {target:,} faces (load a model to calibrate)")
 
     def select_file(self):
         file_path = filedialog.askopenfilename(
@@ -696,7 +814,7 @@ class BenForgeApp(ctk.CTk):
         if not self.blender_bin or not os.path.exists(self.blender_bin):
             self.lbl_inspect_dims.configure(text="Dimensions: Locate Blender to inspect model.")
             if not self.is_processing:
-                self.btn_process.configure(state="normal")
+                self._set_actions_enabled(True)
             return
 
         worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_worker.py")
@@ -741,15 +859,24 @@ class BenForgeApp(ctk.CTk):
             text_color="#A5D6A7"
         )
         self._update_scale_calculation()
-        self._update_slider_label(self.slider_poly.get())
+        # Auto-calibrate the polygon budget to this model's complexity.
+        self._auto_set_decimation()
         if self.blender_bin and not self.is_processing:
-            self.btn_process.configure(state="normal")
-        self.status_lbl.configure(text="Model ready. Adjust settings and click Unfold.", text_color="gray70")
+            self._set_actions_enabled(True)
+        ratio = self._current_decimate_ratio()
+        if polys > RECOMMENDED_FACES:
+            self.status_lbl.configure(
+                text=f"Model ready. Auto-set to ~{self._target_faces():,} faces "
+                     f"({ratio * 100:.2f}% of {polys:,}). Adjust if needed.",
+                text_color="gray70")
+        else:
+            self.status_lbl.configure(text="Model ready. Adjust settings and click Unfold.",
+                                      text_color="gray70")
 
     def _on_inspect_fallback(self):
         self.lbl_inspect_dims.configure(text="Dimensions: Mesh loaded. (Direct inspection skipped)", text_color="gray75")
         if self.blender_bin and not self.is_processing:
-            self.btn_process.configure(state="normal")
+            self._set_actions_enabled(True)
         self.status_lbl.configure(text="Model loaded. Ready to unfold.", text_color="gray70")
 
     def _update_scale_calculation(self):
@@ -797,50 +924,39 @@ class BenForgeApp(ctk.CTk):
 
         return 1.0
 
-    def process_model(self):
+    def _check_ready(self):
+        """Common guards for Preview/Export. Returns True if ready to run."""
+        if self.is_processing:
+            return False
         if not self.input_file:
             messagebox.showwarning("No Input", "Please select a 3D mesh model first.")
-            return
-
+            return False
         if not self.blender_bin or not os.path.exists(self.blender_bin):
             messagebox.showerror(
-                "Engine Missing", 
-                "Could not locate Blender binary.\n\nPlease install Blender or locate your Blender executable using the 'Locate Blender...' button."
+                "Engine Missing",
+                "Could not locate Blender binary.\n\nPlease install Blender or locate "
+                "your Blender executable using the 'Locate Blender...' button."
             )
-            return
+            return False
+        return True
 
-        fmt = self.opt_export_fmt.get().lower()
-        def_ext = f".{fmt}"
-        output_file = filedialog.asksaveasfilename(
-            title=f"Save 2D {fmt.upper()} Pattern",
-            defaultextension=def_ext,
-            filetypes=[(f"{fmt.upper()} File", f"*.{fmt}")]
-        )
-        if not output_file:
-            return
-
-        # Validate inputs
+    def _build_config(self, output_file):
+        """Validate inputs and assemble the worker config dict, or None on error."""
         try:
             tab_val = float(self.entry_tab.get())
         except ValueError:
             messagebox.showerror("Invalid Input", "Tab width must be a valid number.")
-            return
-
+            return None
         try:
             kerf_val = float(self.entry_kerf.get())
         except ValueError:
             kerf_val = 0.0
 
         scale_mult = self._update_scale_calculation()
-
-        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_worker.py")
-        if hasattr(sys, "_MEIPASS"):
-            worker_script = os.path.join(sys._MEIPASS, "blender_worker.py")
-
-        config = {
+        return {
             "input_file": self.input_file,
             "output_file": output_file,
-            "decimate_ratio": float(self.slider_poly.get()),
+            "decimate_ratio": self._current_decimate_ratio(),
             "tab_size": tab_val,
             "use_tabs": bool(self.switch_tabs.get()),
             "page_format": self.opt_page.get(),
@@ -854,59 +970,196 @@ class BenForgeApp(ctk.CTk):
             "kerf_offset_mm": kerf_val
         }
 
-        # Start execution in background thread
-        self.is_processing = True
+    def _confirm_heavy_mesh(self):
+        """Warn when the mesh is dense enough that unfolding may take very long.
+
+        The paper-model unfolder is single-threaded pure Python; tens of
+        thousands of faces can take many minutes. Returns True to proceed.
+        """
+        if not self.mesh_info or "poly_count" not in self.mesh_info:
+            return True
+        est = min(self.mesh_info["poly_count"], self._target_faces())
+        if est <= HEAVY_FACES_WARN:
+            return True
+        return messagebox.askyesno(
+            "Dense Mesh Warning",
+            f"After decimation this pattern will have about {est:,} polygons.\n\n"
+            "Unfolding is single-threaded and may take many minutes (or appear to "
+            "hang) at this density, and a pattern with this many facets is rarely "
+            "practical to cut or fold.\n\n"
+            "Tip: drag the polygon-budget slider left (or click 'Auto') for a "
+            "cleaner, faster result.\n\n"
+            "Proceed anyway?"
+        )
+
+    def _worker_script(self):
+        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_worker.py")
+        if hasattr(sys, "_MEIPASS"):
+            worker_script = os.path.join(sys._MEIPASS, "blender_worker.py")
+        return worker_script
+
+    def process_model(self):
+        if not self._check_ready():
+            return
+
+        fmt = self.opt_export_fmt.get().lower()
+        output_file = filedialog.asksaveasfilename(
+            title=f"Save 2D {fmt.upper()} Pattern",
+            defaultextension=f".{fmt}",
+            filetypes=[(f"{fmt.upper()} File", f"*.{fmt}")]
+        )
+        if not output_file:
+            return
+
+        config = self._build_config(output_file)
+        if config is None:
+            return
+        if not self._confirm_heavy_mesh():
+            return
+
         self.last_output_file = output_file
         self.post_export_frame.pack_forget()
-        self.btn_process.configure(state="disabled")
+        self._start_worker(config, output_file, kind="export",
+                           status="Unfolding 3D mesh via Blender engine... please wait.")
+
+    def preview_model(self):
+        if not self._check_ready():
+            return
+        if PatternPreview is None:
+            messagebox.showerror("Preview Unavailable",
+                                 "The preview module could not be loaded.")
+            return
+        # Previews are always generated as SVG (vector) into a temp folder so we
+        # can render them, regardless of the chosen export format.
+        preview_dir = os.path.join(tempfile.gettempdir(), "benforge_preview")
+        os.makedirs(preview_dir, exist_ok=True)
+        # Clear stale pages from a previous preview run.
+        for old in list(self.preview_files):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        base = os.path.join(preview_dir, "preview.svg")
+        for stale in glob.glob(os.path.join(preview_dir, "preview*.svg")):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
+        config = self._build_config(base)
+        if config is None:
+            return
+        config["export_format"] = "SVG"
+        if not self._confirm_heavy_mesh():
+            return
+
+        self._start_worker(config, base, kind="preview",
+                           status="Generating preview pattern... please wait.")
+
+    def _start_worker(self, config, output_file, kind, status):
+        self.is_processing = True
+        self._set_actions_enabled(False)
         self.btn_select.configure(state="disabled")
-        self.status_lbl.configure(text="Unfolding 3D mesh via Blender engine... please wait.", text_color="#3B8ED0")
+        self.status_lbl.configure(text=status, text_color="#3B8ED0")
         self.progress_bar.start()
-
-        worker_thread = threading.Thread(
+        threading.Thread(
             target=self._run_worker_subprocess,
-            args=(self.blender_bin, worker_script, config, output_file),
+            args=(self.blender_bin, self._worker_script(), config, output_file, kind),
             daemon=True
-        )
-        worker_thread.start()
+        ).start()
 
-    def _run_worker_subprocess(self, blender_bin, worker_script, config, output_file):
-        cmd = [
-            blender_bin,
-            "--background",
-            "--python", worker_script,
-            "--", "unfold", json.dumps(config)
-        ]
+    @staticmethod
+    def _parse_worker_output(text):
+        """Extract (files_list, error_message) from worker stdout markers."""
+        files, error = [], None
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if line.startswith("BENFORGE_OUTPUT_FILES:"):
+                try:
+                    files = json.loads(line[len("BENFORGE_OUTPUT_FILES:"):])
+                except Exception:
+                    pass
+            elif line.startswith("BENFORGE_ERROR:"):
+                error = line[len("BENFORGE_ERROR:"):].strip()
+        return files, error
 
+    def _run_worker_subprocess(self, blender_bin, worker_script, config, output_file, kind):
+        cmd = [blender_bin, "--background", "--python", worker_script,
+               "--", "unfold", json.dumps(config)]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            self.after(0, self._on_process_success, output_file)
-        except subprocess.CalledProcessError as e:
-            err_output = e.stderr if e.stderr else e.stdout
-            self.after(0, self._on_process_failure, err_output or str(e))
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            files, error = self._parse_worker_output(combined)
+            if "BENFORGE_SUCCESS" in combined and files:
+                self.after(0, self._on_process_success, files, kind)
+            else:
+                msg = error or (result.stderr or result.stdout or "Unknown engine error.")
+                self.after(0, self._on_process_failure, msg, kind)
         except Exception as ex:
-            self.after(0, self._on_process_failure, str(ex))
+            self.after(0, self._on_process_failure, str(ex), kind)
 
-    def _on_process_success(self, output_file):
+    def _finish_worker(self):
         self.is_processing = False
         self.progress_bar.stop()
-        self.progress_bar.set(1.0)
-        self.btn_process.configure(state="normal")
+        self._set_actions_enabled(True)
         self.btn_select.configure(state="normal")
-        self.status_lbl.configure(text="Pattern generation complete!", text_color="#2FA572")
+
+    def _on_process_success(self, files, kind):
+        self._finish_worker()
+        self.progress_bar.set(1.0 if kind == "export" else 0)
+        if kind == "preview":
+            self.preview_files = files
+            self.status_lbl.configure(text=f"Preview ready ({len(files)} page(s)).",
+                                      text_color="#2FA572")
+            self._open_preview_window(files, title="Pattern Preview")
+            return
+        # export
+        self.last_output_files = files
+        self.last_output_file = files[0]
+        pages = f" ({len(files)} pages)" if len(files) > 1 else ""
+        self.status_lbl.configure(text=f"Pattern generation complete!{pages}",
+                                  text_color="#2FA572")
         self.post_export_frame.pack(pady=(8, 0))
-        messagebox.showinfo("Export Successful", f"Vector pattern exported successfully to:\n\n{output_file}")
+        listing = "\n".join(os.path.basename(f) for f in files)
+        messagebox.showinfo("Export Successful",
+                            f"Vector pattern exported successfully:\n\n{listing}")
 
-    def _on_process_failure(self, error_message):
-        self.is_processing = False
-        self.progress_bar.stop()
+    def _on_process_failure(self, error_message, kind="export"):
+        self._finish_worker()
         self.progress_bar.set(0)
-        self.btn_process.configure(state="normal")
-        self.btn_select.configure(state="normal")
-        self.status_lbl.configure(text="Unfolding failed. Review error log.", text_color="#D32F2F")
+        self.status_lbl.configure(text="Unfolding failed. Review error log.",
+                                  text_color="#D32F2F")
+        preview = error_message.strip()
+        if len(preview) > 1200:
+            preview = preview[-1200:]
+        messagebox.showerror("Execution Error",
+                             f"Worker engine failed to unfold mesh:\n\n{preview}")
 
-        preview = error_message.strip()[-800:] if len(error_message) > 800 else error_message
-        messagebox.showerror("Execution Error", f"Worker engine failed to unfold mesh:\n\n{preview}")
+    def _open_preview_window(self, files, title):
+        existing = [f for f in files if os.path.exists(f)]
+        if not existing:
+            messagebox.showwarning("Nothing to Preview", "No pattern pages were found to display.")
+            return
+        try:
+            PatternPreview(self, existing, title=title)
+        except Exception as e:
+            messagebox.showerror("Preview Error", f"Could not open preview window:\n\n{e}")
+
+    def _preview_last_export(self):
+        if not self.last_output_files:
+            messagebox.showinfo("No Pattern", "Export a pattern first, then preview it.")
+            return
+        if PatternPreview is None:
+            messagebox.showerror("Preview Unavailable", "The preview module could not be loaded.")
+            return
+        # Only SVG pages can be rendered by the lightweight previewer.
+        svgs = [f for f in self.last_output_files if f.lower().endswith(".svg")]
+        if not svgs:
+            messagebox.showinfo("Preview Unavailable",
+                                "On-screen preview supports SVG output. Use 'Open Vector Pattern' "
+                                "to view PDF exports in your system viewer.")
+            return
+        self._open_preview_window(svgs, title="Exported Pattern Preview")
 
     def _open_output_folder(self):
         if self.last_output_file and os.path.exists(self.last_output_file):
