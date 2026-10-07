@@ -130,55 +130,57 @@ def process_svg_layers(
             "stroke": "none"
         })
 
-        # Categorize existing elements
-        elements_to_remove = []
-        for elem in list(root):
+        # Collect all drawable items across the SVG tree
+        all_items = []
+        for elem in root.iter():
             tag = clean_tag(elem.tag)
-            if tag in ("defs", "style", "metadata"):
-                continue
+            if tag in ("path", "polyline", "polygon", "line", "text"):
+                all_items.append(elem)
 
+        for elem in all_items:
+            tag = clean_tag(elem.tag)
             elem_id = elem.attrib.get("id", "").lower()
-            stroke = elem.attrib.get("stroke", "").lower()
+            cls = elem.attrib.get("class", "").lower()
             dash = elem.attrib.get("stroke-dasharray", "").lower()
-            style = elem.attrib.get("style", "").lower()
 
             if tag == "text":
                 if print_seam_numbers or print_bend_angles:
                     elem.attrib["fill"] = preset["text_color"]
                     layer_text.append(elem)
-                elements_to_remove.append(elem)
-            elif tag in ("path", "polyline", "polygon", "line", "g"):
-                # Detect mountain vs valley vs cut line based on stroke/dash attributes
-                is_dash = bool(dash and dash != "none") or "dasharray" in style
-                is_tab = "tab" in elem_id or "flap" in elem_id
+            elif tag in ("path", "polyline", "polygon", "line"):
+                is_tab = "sticker" in cls or "tab" in elem_id or "flap" in elem_id
+                if is_tab:
+                    if not use_tabs and (material_mode in ("Sheet Metal", "EVA Foam")):
+                        continue  # Skip tab geometry in metal/foam mode
+                    else:
+                        elem.attrib["stroke"] = preset["cut_color"]
+                        layer_cut.append(elem)
+                        continue
 
-                if is_tab and not use_tabs and (material_mode in ("Sheet Metal", "EVA Foam")):
-                    # In Sheet Metal or Foam mode without tabs, skip tab geometry
-                    elements_to_remove.append(elem)
-                    continue
+                is_mountain = "convex" in cls or "mountain" in elem_id or (bool(dash and dash != "none") and "outer" not in cls)
+                is_valley = "concave" in cls or "valley" in elem_id
 
-                if is_dash or "mountain" in elem_id or "fold" in elem_id:
+                if is_mountain:
                     elem.attrib["stroke"] = preset["mountain_color"]
                     elem.attrib["stroke-dasharray"] = preset["mountain_dash"]
+                    elem.attrib["fill"] = "none"
                     layer_mountain.append(elem)
-                elif "valley" in elem_id:
+                elif is_valley:
                     elem.attrib["stroke"] = preset["valley_color"]
                     elem.attrib["stroke-dasharray"] = preset["valley_dash"]
+                    elem.attrib["fill"] = "none"
                     layer_valley.append(elem)
                 else:
                     elem.attrib["stroke"] = preset["cut_color"]
                     elem.attrib["fill"] = "none"
                     layer_cut.append(elem)
-                elements_to_remove.append(elem)
 
-        # Remove raw uncategorized elements from root
-        for elem in elements_to_remove:
-            try:
-                root.remove(elem)
-            except ValueError:
-                pass
+        # Clear existing non-defs/style/metadata children from root
+        for c in list(root):
+            if clean_tag(c.tag) not in ("defs", "style", "metadata"):
+                root.remove(c)
 
-        # Append structured layers in standard CNC cutting order (Text first -> Score/Bend folds -> Outer Cut last)
+        # Append structured layers in CNC cutting order (Text first -> Score/Bend folds -> Outer Cut last)
         root.append(layer_text)
         root.append(layer_mountain)
         root.append(layer_valley)

@@ -47,6 +47,8 @@ def run_inspect(config):
     else:
         active_obj = meshes[0]
 
+    if active_obj.data.users > 1:
+        active_obj.data = active_obj.data.copy()
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
     dims = active_obj.dimensions  # Vector (X, Y, Z) in meters / scene units
     poly_count = len(active_obj.data.polygons)
@@ -141,6 +143,8 @@ def run_unfolder(config):
         obj.select_set(True)
 
     # Apply initial transforms
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
     bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
     # 4. Anatomical / User Scaling
@@ -175,22 +179,45 @@ def run_unfolder(config):
     # 7. Unfold Mesh
     print("Calculating optimal cut seams and unfolding mesh...")
     try:
-        bpy.ops.export_paper_model.unfold()
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        if hasattr(bpy.ops.mesh, 'unfold'):
+            bpy.ops.mesh.unfold()
+        bpy.ops.object.mode_set(mode='OBJECT')
     except Exception as e:
         print(f"Unfold operator notice: {e}")
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
 
     # 8. Export to Vector File
-    tab_size_m = (tab_size / 1000.0) if use_tabs else 0.001
+    tab_size_m = (tab_size / 1000.0) if use_tabs else 0.005
+    page_preset = page_format.upper().split()[0] if page_format else "A3"
+    valid_presets = ["A4", "A3", "A2", "A1", "LETTER", "LEGAL"]
+    page_arg = page_preset if page_preset in valid_presets else "A3"
 
-    print(f"Exporting raw pattern to {output_file}...")
+    print(f"Exporting pattern to {output_file} (Page: {page_arg}, Format: {export_format})...")
     try:
-        bpy.ops.export_paper_model.execute(
-            filepath=output_file,
-            page_size_preset=page_format,
-            use_tabs=use_tabs,
-            tabs_width=tab_size_m,
-            export_format=export_format
-        )
+        if hasattr(bpy.ops.export_mesh, 'paper_model'):
+            bpy.ops.export_mesh.paper_model(
+                filepath=output_file,
+                page_size_preset=page_arg,
+                do_create_stickers=use_tabs,
+                do_create_numbers=print_seam_numbers,
+                sticker_width=tab_size_m,
+                file_format=export_format
+            )
+        elif hasattr(bpy.ops.export_paper_model, 'execute'):
+            bpy.ops.export_paper_model.execute(
+                filepath=output_file,
+                page_size_preset=page_arg,
+                use_tabs=use_tabs,
+                tabs_width=tab_size_m,
+                export_format=export_format
+            )
+        else:
+            raise RuntimeError("No paper model exporter operator found in Blender.")
         print("Raw pattern exported successfully.")
     except Exception as e:
         print(f"Error executing paper model exporter: {e}")
