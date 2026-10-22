@@ -69,7 +69,11 @@ class BenForgeApp(ctk.CTk):
         self._build_menu_bar()
         self._build_ui()
         self._update_engine_status()
-        self._apply_material_preset("Sheet Metal (Press Brake / Weld)")
+        # Default to the papercraft preset and Simple Mode: a beginner just
+        # drops in a model and clicks Create, with glue tabs and numbered
+        # seams on and no metal/foam/laser jargon in view.
+        self._apply_material_preset("Papercraft / Cardboard")
+        self._apply_ui_mode(False)
 
     def _resolve_blender_binary(self):
         """Finds Blender executable across development, portable, and system locations."""
@@ -179,11 +183,17 @@ class BenForgeApp(ctk.CTk):
 
         # Settings / Preferences Menu
         self.pref_tooltips_var = tk.BooleanVar(value=True)
+        self.pref_advanced_var = tk.BooleanVar(value=False)
         pref_menu = tk.Menu(menubar, tearoff=0)
         pref_menu.add_checkbutton(
             label="Show Helpful Tooltips",
             variable=self.pref_tooltips_var,
             command=self._on_toggle_tooltips_menu
+        )
+        pref_menu.add_checkbutton(
+            label="Advanced Mode (Metal / Foam / Laser)",
+            variable=self.pref_advanced_var,
+            command=self._on_toggle_advanced_menu
         )
         pref_menu.add_separator()
         pref_menu.add_command(label="Locate Blender Binary...", command=self._manual_locate_blender)
@@ -200,14 +210,12 @@ class BenForgeApp(ctk.CTk):
     def _show_about(self):
         messagebox.showinfo(
             f"About {APP_NAME}",
-            f"{APP_NAME} — 3D Pattern Unfolder & Metal/Armor Suite\n"
+            f"{APP_NAME} — 3D Pattern Unfolder\n"
             f"Version: {VERSION}\n\n"
-            "Converts 3D STL & OBJ meshes into flattened 2D vector patterns for:\n"
-            "• CNC Sheet Metal & Press Brake Bending\n"
-            "• Laser Cutters (LightBurn, Glowforge)\n"
-            "• EVA Foam Armor & Cosplay\n"
-            "• Papercraft & Cardboard Prototyping\n\n"
-            "Powered by CustomTkinter & Headless Blender Engine."
+            "Drop in a 3D model (.stl or .obj) and print a paper fold-out "
+            "pattern you can cut out, fold, and glue together.\n\n"
+            "Turn on Advanced Mode (Settings menu, or the header switch) for "
+            "sheet metal, EVA foam, and laser/CNC machine presets."
         )
 
     def _on_toggle_tooltips_menu(self):
@@ -219,6 +227,57 @@ class BenForgeApp(ctk.CTk):
         enabled = bool(self.switch_tooltips_header.get())
         ToolTip.enabled = enabled
         self.pref_tooltips_var.set(enabled)
+
+    def _on_toggle_advanced_menu(self):
+        enabled = bool(self.pref_advanced_var.get())
+        if enabled:
+            self.switch_advanced_header.select()
+        else:
+            self.switch_advanced_header.deselect()
+        self._apply_ui_mode(enabled)
+
+    def _on_toggle_advanced_switch(self):
+        enabled = bool(self.switch_advanced_header.get())
+        self.pref_advanced_var.set(enabled)
+        self._apply_ui_mode(enabled)
+
+    def _apply_ui_mode(self, advanced):
+        """Show or hide fabrication-pro controls (metal/foam/laser/CNC).
+
+        Beginner/papercraft defaults stay in effect underneath even when
+        these are hidden, so toggling this off never loses a setting.
+        """
+        self.advanced_mode = advanced
+
+        # Whole cards that only matter for fabrication pros.
+        if advanced:
+            self.decimate_card.pack(fill="x", padx=15, pady=6, before=self.sheet_card)
+            self.mat_card.pack(fill="x", padx=15, pady=6, before=self.sheet_card)
+        else:
+            self.decimate_card.pack_forget()
+            self.mat_card.pack_forget()
+
+        # Anatomical body-part preset picker (cosplay/armor sizing shortcut).
+        if advanced:
+            self.lbl_part_type.pack(side="left", padx=(0, 6), before=self.lbl_units)
+            self.opt_part_type.pack(side="left", padx=(0, 20), before=self.lbl_units)
+        else:
+            self.lbl_part_type.pack_forget()
+            self.opt_part_type.pack_forget()
+
+        # Clothing/liner padding allowance on top of the target size.
+        if advanced:
+            self.lbl_padding.pack(side="left", padx=(0, 5), before=self.lbl_calculated_scale)
+            self.entry_padding.pack(side="left", padx=(0, 15), before=self.lbl_calculated_scale)
+        else:
+            self.lbl_padding.pack_forget()
+            self.entry_padding.pack_forget()
+
+        # Multi-part auto-join toggle (left on by default either way).
+        if advanced:
+            self.switch_join.pack(side="left")
+        else:
+            self.switch_join.pack_forget()
 
     def _build_ui(self):
         # Top Scrollable Container to fit all controls comfortably
@@ -248,9 +307,21 @@ class BenForgeApp(ctk.CTk):
         self.switch_tooltips_header.pack(side="right", padx=5)
         attach_tooltip(self.switch_tooltips_header, "Toggle hover tooltips across the entire application on or off.")
 
+        # Advanced Mode Switch — reveals material/machine/metal-fab controls.
+        # Off by default so first-time hobbyists see a short, simple workflow.
+        self.switch_advanced_header = ctk.CTkSwitch(
+            self.header_frame,
+            text="Advanced Mode",
+            command=self._on_toggle_advanced_switch,
+            width=70,
+            font=ctk.CTkFont(size=12)
+        )
+        self.switch_advanced_header.pack(side="right", padx=5)
+        attach_tooltip(self.switch_advanced_header, "Show material presets, machine profiles, polygon budget, and other fabrication controls for metal, foam, and laser work.")
+
         self.sub_header = ctk.CTkLabel(
-            self.scroll_canvas, 
-            text="Unfold 3D models into 2D cut sheets with bend angles, weld seams, and machine-coded vector layers.", 
+            self.scroll_canvas,
+            text="Turn a 3D model into a printable paper fold-out: select a model, then click Create.",
             text_color="gray70",
             font=ctk.CTkFont(size=12)
         )
@@ -331,7 +402,8 @@ class BenForgeApp(ctk.CTk):
         row_fit1 = ctk.CTkFrame(self.fit_card, fg_color="transparent")
         row_fit1.pack(fill="x", padx=12, pady=4)
 
-        ctk.CTkLabel(row_fit1, text="Body / Part Type:").pack(side="left", padx=(0, 6))
+        self.lbl_part_type = ctk.CTkLabel(row_fit1, text="Body / Part Type:")
+        self.lbl_part_type.pack(side="left", padx=(0, 6))
         self.opt_part_type = ctk.CTkOptionMenu(
             row_fit1,
             values=[
@@ -351,7 +423,8 @@ class BenForgeApp(ctk.CTk):
         self.opt_part_type.pack(side="left", padx=(0, 20))
         attach_tooltip(self.opt_part_type, "Select anatomical body location to configure dimension and clearance guidelines.")
 
-        ctk.CTkLabel(row_fit1, text="Units:").pack(side="left", padx=(0, 6))
+        self.lbl_units = ctk.CTkLabel(row_fit1, text="Units:")
+        self.lbl_units.pack(side="left", padx=(0, 6))
         self.opt_unit = ctk.CTkOptionMenu(
             row_fit1,
             values=["Millimeters (mm)", "Centimeters (cm)", "Inches (in)"],
@@ -372,22 +445,23 @@ class BenForgeApp(ctk.CTk):
             command=self._update_scale_calculation,
             font=ctk.CTkFont(weight="bold")
         )
-        self.switch_autofit.select()
+        self.switch_autofit.deselect()
         self.switch_autofit.pack(side="left", padx=(0, 15))
-        attach_tooltip(self.switch_autofit, "Enable to automatically scale the 3D model to your specified target dimension. Leave off for 1:1 original CAD scale.")
+        attach_tooltip(self.switch_autofit, "Enable to automatically scale the 3D model to your specified target dimension. Leave off to keep the model's original CAD scale.")
 
         self.lbl_target_dim = ctk.CTkLabel(row_fit2, text="Target Height (mm):")
         self.lbl_target_dim.pack(side="left", padx=(0, 5))
 
         self.entry_target_dim = ctk.CTkEntry(row_fit2, width=80)
-        self.entry_target_dim.insert(0, "290.0")
+        self.entry_target_dim.insert(0, "150.0")
         self.entry_target_dim.pack(side="left", padx=(0, 15))
         self.entry_target_dim.bind("<KeyRelease>", lambda e: self._update_scale_calculation())
-        attach_tooltip(self.entry_target_dim, "Desired final dimension of the assembled piece in chosen units (e.g., 290 mm for adult helmet height).")
+        attach_tooltip(self.entry_target_dim, "Desired final height of the printed model in your chosen units.")
 
-        ctk.CTkLabel(row_fit2, text="Padding / Allowance:").pack(side="left", padx=(0, 5))
+        self.lbl_padding = ctk.CTkLabel(row_fit2, text="Padding / Allowance:")
+        self.lbl_padding.pack(side="left", padx=(0, 5))
         self.entry_padding = ctk.CTkEntry(row_fit2, width=65)
-        self.entry_padding.insert(0, "+10mm")
+        self.entry_padding.insert(0, "+0mm")
         self.entry_padding.pack(side="left", padx=(0, 15))
         self.entry_padding.bind("<KeyRelease>", lambda e: self._update_scale_calculation())
         attach_tooltip(self.entry_padding, "Extra clearance allowance for gambeson, foam liner, or clothing (e.g., '+10mm' or '+5%').")
@@ -545,27 +619,16 @@ class BenForgeApp(ctk.CTk):
         ctk.CTkLabel(row_sheet, text="Sheet / Bed Size:").pack(side="left", padx=(0, 6))
         self.opt_page = ctk.CTkOptionMenu(
             row_sheet,
-            values=[
-                "A3",
-                "A4",
-                "A2",
-                "A1",
-                "LETTER",
-                "LEGAL",
-                "600x400mm (Laser)",
-                "24x12in (Sheet)",
-                "24x24in (Sheet)",
-                "48x24in (Sheet)"
-            ],
+            values=["A4", "A3", "A2", "A1", "LETTER", "LEGAL"],
             width=160
         )
-        self.opt_page.set("A3")
+        self.opt_page.set("A4")
         self.opt_page.pack(side="left", padx=(0, 20))
-        attach_tooltip(self.opt_page, "Target sheet or cutting bed dimensions. Patterns will be arranged to fit this stock.")
+        attach_tooltip(self.opt_page, "Paper size to print the pattern on. Patterns are split across multiple pages if the model doesn't fit on one.")
 
         ctk.CTkLabel(row_sheet, text="Format:").pack(side="left", padx=(0, 6))
-        self.opt_export_fmt = ctk.CTkOptionMenu(row_sheet, values=["SVG", "PDF"], width=90)
-        self.opt_export_fmt.set("SVG")
+        self.opt_export_fmt = ctk.CTkOptionMenu(row_sheet, values=["PDF", "SVG"], width=90)
+        self.opt_export_fmt.set("PDF")
         self.opt_export_fmt.pack(side="left", padx=(0, 20))
         attach_tooltip(self.opt_export_fmt, "SVG: Recommended for laser and CNC machines.\nPDF: Recommended for paper printers.")
 
@@ -597,7 +660,7 @@ class BenForgeApp(ctk.CTk):
 
         self.btn_process = ctk.CTkButton(
             action_row,
-            text="2. Unfold & Export Vector Pattern",
+            text="2. Create Fold-Out Pattern",
             command=self.process_model,
             fg_color="#1f6aa5",
             hover_color="#144f7d",
@@ -606,7 +669,7 @@ class BenForgeApp(ctk.CTk):
             state="disabled"
         )
         self.btn_process.pack(side="left", fill="x", expand=True)
-        attach_tooltip(self.btn_process, "Executes the headless Blender engine to decimate, calculate seams, and generate 2D vector patterns.")
+        attach_tooltip(self.btn_process, "Unfolds the model and saves a printable cut-and-fold pattern to a file.")
 
         self.progress_bar = ctk.CTkProgressBar(self.action_card, mode="indeterminate")
         self.progress_bar.pack(fill="x", pady=(10, 4))
